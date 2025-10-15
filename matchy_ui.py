@@ -1,3 +1,5 @@
+"""Initialize the Matchy GUI app, set up state variables, caches, and build the UI."""
+
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, StringVar, DoubleVar
@@ -7,13 +9,35 @@ import numpy as np
 
 try:
     # package import when installed or run as package
-    from .matchy_logic import MatchyLogic, load_rew_txt, downsample_pairs
+    from .matchy_logic import MatchyLogic, load_rew_txt # downsample_pairs
 except Exception:
     # fallback to local import when running as a script from the repo folder
-    from matchy_logic import MatchyLogic, load_rew_txt, downsample_pairs
+    from matchy_logic import MatchyLogic, load_rew_txt # downsample_pairs
 
+# todo: Refactor MatchyApp instance attributes to separate class/dataclass
+# todo: Get _create_treeview() working and reusable for _build_import_tab, _build_prepare_tab, _build_results_tab
+# todo: Refactor inline lambdas to functions
+# todo: (MAYBE) Break up UI to import, prepare and results modules?
 
 class MatchyApp(tk.Tk):
+    """
+    Main GUI application window for Matchy.
+
+    Handles user interaction, visualization, and communication
+    with the MatchyLogic backend for frequency matching analysis.
+
+    Tabs:
+        1. Import  - Select folder and preprocessing settings
+        2. Prepare - Manage filtering, outlier handling, and preview plots
+        3. Results - View computed monitor pairings and export data
+    """
+
+    DEFAULT_FREQ_MIN = 20.0
+    DEFAULT_FREQ_MAX = 20000.0
+    IMPORT_LEFT_PANEL_COLS = ("Filename", "#datapoints", "Min_freq", "Max_freq")
+    PREPARE_TAB_COLS = ("ID", "Filename", "datapoints", "Avg dB", "AbsDev", "Rank")
+    RESULTS_TAB_COLS = ("Partition ID", "Partition Avg RMS", "Monitor 1", "Monitor 2", "Pair RMS", "Leftover")
+
     def __init__(self):
         super().__init__()
         self.title("Matchy v0.2.3")
@@ -22,21 +46,35 @@ class MatchyApp(tk.Tk):
         # Logic handler
         self.logic = MatchyLogic()
 
-        # --- State ---
+        # --- State --- MAYBE: Refactor to own dataclass? ref R0902
         self.folder = StringVar(value="")
-        self.files, self.file_stats, self.filtered_files, self.all_filtered_files, self.active_files = [], {}, [], [], []
-        self.freq_range, self.downsample = (20.0, 20000.0), None
+        self.files = []
+        self.file_stats = {}
+        self.filtered_files = []
+        self.all_filtered_files =  []
+        self.active_files = []
+        self.freq_range = (self.DEFAULT_FREQ_MIN, self.DEFAULT_FREQ_MAX)
+        self.downsample = None
 
-        # --- Caches ---
-        self.file_data_cache, self.processed_data_cache, self._outlier_data = {}, {}, None
+        # --- Caches --- MAYBE: Refactor to own dataclass?
+        self.file_data_cache = {}
+        self.processed_data_cache = {}
+        self._outlier_data = None
 
+        # --- Tkinter widgets --- MAYBE: Refactor to own dataclass?
+        self.file_tree: ttk.Treeview
+        self.fmin_var: DoubleVar
+        self.fmax_var: DoubleVar
+        self.down_var: StringVar
+        self.prep_tree: ttk.Treeview
+        self.show_relative_var: tk.BooleanVar
         self._build_ui()
 
     def _build_ui(self):
+        """Construct the main tabbed interface for Import, Prepare, and Results."""
         nb = ttk.Notebook(self)
         nb.pack(fill=tk.BOTH, expand=True)
-        self.tab_import, self.tab_prepare, self.tab_results = ttk.Frame(
-            nb), ttk.Frame(nb), ttk.Frame(nb)
+        self.tab_import, self.tab_prepare, self.tab_results = ttk.Frame(nb),ttk.Frame(nb), ttk.Frame(nb)
         nb.add(self.tab_import, text="Import")
         nb.add(self.tab_prepare, text="Prepare")
         nb.add(self.tab_results, text="Results")
@@ -44,23 +82,60 @@ class MatchyApp(tk.Tk):
         self._build_prepare_tab(self.tab_prepare)
         self._build_results_tab(self.tab_results)
 
+    def _create_treeview(self, parent, columns, column_widths=None, selectmode='browse'):
+        """
+        Reusable helper to create and pack a Treeview with scrollbar and column setup.
+
+        Args:
+            parent (tk.Widget): The parent container for the Treeview.
+            columns (Iterable[str]): Column names for the Treeview.
+            column_widths (Iterable[int] | None): Optional list of widths for columns.
+            selectmode (str): Selection mode ('browse', 'extended', etc.)
+
+        Returns:
+            ttk.Treeview: The configured Treeview widget.
+        """
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(frame, columns=columns, show='headings', selectmode=selectmode) # cannot pass str as literal selectmode param?!
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        for i, c in enumerate(columns):
+            width = column_widths[i] if column_widths and i < len(column_widths) else 80
+            tree.heading(c, text=c)
+            tree.column(c, width=width, anchor=tk.CENTER)
+
+        return tree
+
     # ---------------- Import Tab ----------------
     def _build_import_tab(self, parent):
+        """Build Import tab layout and widgets for file selection and preprocessing."""
+        self._build_import_left_panel(parent)
+        self._build_import_right_panel(parent)
+
+    def _build_import_left_panel(self, parent):
+        """Create the file list panel showing imported .txt files and basic statistics."""
         left = ttk.Frame(parent)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        cols = ("Filename", "#datapoints", "Min_freq", "Max_freq")
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         self.file_tree = ttk.Treeview(
-            tree_frame, columns=cols, show="headings")
-        for c in cols:
+            tree_frame, columns=self.IMPORT_LEFT_PANEL_COLS, show="headings")
+        for c in self.IMPORT_LEFT_PANEL_COLS:
             self.file_tree.heading(c, text=c)
             self.file_tree.column(c, width=80, anchor=tk.CENTER)
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
-                            command=self.file_tree.yview)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.file_tree.yview)
         self.file_tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _build_import_right_panel(self, parent):
+        """Create the right-side controls for folder selection and preprocessing parameters."""
         right = ttk.Frame(parent, width=360)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
         ttk.Button(right, text="Select Folder",
@@ -72,11 +147,11 @@ class MatchyApp(tk.Tk):
         fr = ttk.Frame(hdr)
         fr.pack(fill=tk.X, padx=4, pady=4)
         ttk.Label(fr, text="Freq min:").grid(row=0, column=0, sticky=tk.W)
-        self.fmin_var = DoubleVar(value=20.0)
+        self.fmin_var = DoubleVar(value=self.DEFAULT_FREQ_MIN)
         ttk.Entry(fr, textvariable=self.fmin_var,
                   width=10).grid(row=0, column=1)
         ttk.Label(fr, text="Freq max:").grid(row=1, column=0, sticky=tk.W)
-        self.fmax_var = DoubleVar(value=20000.0)
+        self.fmax_var = DoubleVar(value=self.DEFAULT_FREQ_MAX)
         ttk.Entry(fr, textvariable=self.fmax_var,
                   width=10).grid(row=1, column=1)
         ttk.Label(hdr, text="Downsample:").pack(anchor=tk.W)
@@ -87,12 +162,14 @@ class MatchyApp(tk.Tk):
             fill=tk.X, pady=2)
 
     def select_folder(self):
+        """Prompt user to select a folder and trigger a file scan."""
         p = filedialog.askdirectory()
         if p:
             self.folder.set(p)
             self._scan_folder()
 
     def _scan_folder(self):
+        """Scan the selected folder for .txt files, load frequency data, and populate the cache."""
         self.files.clear()
         self.file_stats.clear()
         self.file_data_cache.clear()
@@ -105,6 +182,29 @@ class MatchyApp(tk.Tk):
         self._refresh_file_tree(raw=True)
 
     def _refresh_file_tree(self, raw=False):
+        """Refresh the file list display with current files and statistics.
+
+        Args:
+            raw (bool): If True, recalculate file statistics from raw data.
+        """
+        for fn in self.files:
+            f, _ = self.file_data_cache.get(fn, (np.array([]), np.array([])))
+            if not f.size:
+                continue
+            st = self.file_stats.get(fn, {}) if not raw else {}
+            if raw:
+                st.update({
+                    'datapoints': len(f),
+                    'min_freq': np.min(f),
+                    'max_freq': np.max(f)
+                })
+            self.file_tree.insert("", "end", values=(
+                os.path.splitext(fn)[0],
+                st.get('datapoints', 0),
+                f"{st.get('min_freq', 0):.3f}",
+                f"{st.get('max_freq', 0):.3f}"
+            ))
+
         for i in self.file_tree.get_children():
             self.file_tree.delete(i)
         if not self.files:
@@ -122,6 +222,7 @@ class MatchyApp(tk.Tk):
                 'datapoints', 0), f"{st.get('min_freq', 0):.3f}", f"{st.get('max_freq', 0):.3f}"))
 
     def apply_import_settings(self):
+        """Apply frequency and downsample settings, process files through logic module, and refresh displays."""
         try:
             fmin, fmax = float(self.fmin_var.get()), float(self.fmax_var.get())
         except:
@@ -146,26 +247,27 @@ class MatchyApp(tk.Tk):
         self.prepare_update_plot()
         if hasattr(self, 'update_outlier_slider_range'):
             self.update_outlier_slider_range()
-        self._on_outlier_change()
+        self._on_outlier_update()
 
     def import_next_to_prepare(self):
+        """Apply import settings and automatically navigate to the Prepare tab."""
         self.apply_import_settings()
         self.nametowidget(self.winfo_children()[0]).select(1)
         self.prepare_update_plot()
-        self._on_outlier_change()
+        self._on_outlier_update()
 
     # ---------------- Prepare Tab ----------------
     def _build_prepare_tab(self, parent):
+        """Build the Prepare tab layout, including file overview, outlier controls, and preview plot."""
         top = ttk.Frame(parent)
         top.pack(fill=tk.BOTH, expand=True)
         left = ttk.Frame(top, width=500)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
-        cols = ("ID", "Filename", "datapoints", "Avg dB", "AbsDev", "Rank")
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         self.prep_tree = ttk.Treeview(
-            tree_frame, columns=cols, show='headings', selectmode='extended')
-        for c in cols:
+            tree_frame, columns=self.PREPARE_TAB_COLS, show='headings', selectmode='extended')
+        for c in self.PREPARE_TAB_COLS:
             self.prep_tree.heading(c, text=c)
             self.prep_tree.column(c, width=75, anchor=tk.CENTER)
         vsb = ttk.Scrollbar(tree_frame, orient="vertical",
@@ -173,10 +275,10 @@ class MatchyApp(tk.Tk):
         self.prep_tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.prep_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._attach_sort_menu(self.prep_tree, {c: c for c in cols})
+        self._attach_sort_menu(self.prep_tree, {c: c for c in self.PREPARE_TAB_COLS})
         self.show_relative_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(left, text="Show graphs relative to curated mean",
-                        variable=self.show_relative_var, command=self._on_outlier_change).pack(anchor='w', pady=4)
+                        variable=self.show_relative_var, command=self._on_outlier_update).pack(anchor='w', pady=4)
         bottom = ttk.Frame(parent)
         bottom.pack(fill=tk.X, padx=8, pady=8)
         ttk.Button(bottom, text="Back",
@@ -188,13 +290,13 @@ class MatchyApp(tk.Tk):
             row=0, column=0, sticky='e', padx=5, pady=5)
         self.out_tol = tk.IntVar(value=1)
         self.outlier_scale = tk.Scale(out_frame, from_=1, to=2, orient='horizontal',
-                                      variable=self.out_tol, command=self._on_outlier_change, resolution=1)
+                                      variable=self.out_tol, command=self._on_outlier_update, resolution=1)
         self.outlier_scale.grid(row=0, column=1, sticky='ew', padx=5)
         self.out_tol_entry = ttk.Entry(
             out_frame, width=6, textvariable=self.out_tol)
         self.out_tol_entry.grid(row=0, column=2, padx=5)
         self.out_tol_entry.bind(
-            "<Return>", lambda e: self._on_outlier_change())
+            "<Return>", lambda e: self._on_outlier_update())
         self.update_outlier_slider_range = lambda: (self.outlier_scale.configure(from_=1, to=max(
             1, len(self.all_filtered_files))), self.out_tol.set(max(1, len(self.all_filtered_files))))
         self.metric_mode = tk.StringVar(value="rms")
@@ -205,7 +307,7 @@ class MatchyApp(tk.Tk):
         ttk.Radiobutton(radio_frame, text="N/A",
                         variable=self.metric_mode, value="avg").pack(side=tk.LEFT)
         ttk.Button(bottom, text="Match!",
-                   command=self._apply_outliers_and_next).pack(side=tk.RIGHT)
+                   command=self._apply_outliers_and_continue).pack(side=tk.RIGHT)
         plot_frame = ttk.Frame(top)
         plot_frame.pack(fill=tk.BOTH, expand=True, padx=8)
         self.fig = Figure(figsize=(6, 3))
@@ -214,6 +316,7 @@ class MatchyApp(tk.Tk):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def prepare_update_plot(self):
+        """Update the Prepare tab file list and re-render the preview plot."""
         for i in self.prep_tree.get_children():
             self.prep_tree.delete(i)
         for idx, fn in enumerate(self.all_filtered_files, start=1):
@@ -223,6 +326,7 @@ class MatchyApp(tk.Tk):
         self._plot_prep()
 
     def _plot_prep(self):
+        """Plot up to the first few filtered frequency curves for quick visual reference."""
         self.ax.clear()
         if not self.all_filtered_files:
             self.ax.set_title('(no files)')
@@ -242,13 +346,15 @@ class MatchyApp(tk.Tk):
         self.canvas.draw_idle()
 
     def _compute_outlier_data(self):
+        """Delegate to logic module to compute outlier metrics and cache the results."""
         # delegate to logic
         self.logic.all_filtered_files = list(self.all_filtered_files)
         self.logic.processed_data_cache = dict(self.processed_data_cache)
         self.logic._compute_outlier_data()
         self._outlier_data = self.logic._outlier_data
 
-    def _on_outlier_change(self, _ev=None):
+    def _on_outlier_update(self, _ev=None):
+        """Handle updates to outlier tolerance or relative display toggle, updating plots and table colors."""
         if not hasattr(self, "_outlier_data") or self._outlier_data is None:
             self._compute_outlier_data()
         if not self._outlier_data:
@@ -295,7 +401,8 @@ class MatchyApp(tk.Tk):
                      linewidth=0.4, alpha=0.7)
         self.canvas.draw_idle()
 
-    def _apply_outliers_and_next(self):
+    def _apply_outliers_and_continue(self):
+        """Apply the current outlier filter and move to the Results tab."""
         tol_rank_limit = int(self.out_tol.get())
         if not self._outlier_data:
             self.active_files = list(self.all_filtered_files)
@@ -305,22 +412,22 @@ class MatchyApp(tk.Tk):
         self._build_and_display_partitions(self.active_files)
         self.nametowidget(self.winfo_children()[0]).select(2)
 
-    def _goto_tab(self, idx): self.nametowidget(
-        self.winfo_children()[0]).select(idx)
+    def _goto_tab(self, idx):
+        """Switch to the given tab index in the notebook."""
+        self.nametowidget(self.winfo_children()[0]).select(idx)
 
     # ---------------- Results Tab ----------------
     def _build_results_tab(self, parent):
+        """Build the Results tab layout with partitions table, plot, and export button."""
         main_pane = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         left_frame = ttk.LabelFrame(main_pane, text="Monitor Partitions")
         main_pane.add(left_frame, weight=3)
 
-        cols = ("Partition ID", "Partition Avg RMS",
-                "Monitor 1", "Monitor 2", "Pair RMS", "Leftover")
         self.partition_tree = ttk.Treeview(
-            left_frame, columns=cols, show='headings')
-        for c in cols:
+            left_frame, columns=self.RESULTS_TAB_COLS, show='headings')
+        for c in self.RESULTS_TAB_COLS:
             w = 120 if c in ("Monitor 1", "Monitor 2") else 100
             self.partition_tree.heading(c, text=c)
             self.partition_tree.column(c, width=w, anchor=tk.CENTER)
@@ -331,8 +438,7 @@ class MatchyApp(tk.Tk):
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.partition_tree.pack(fill=tk.BOTH, expand=True)
         self._attach_sort_menu(self.partition_tree, {})
-        self.partition_tree.bind('<<TreeviewSelect>>',
-                                 self._on_partition_select)
+        self.partition_tree.bind('<<TreeviewSelect>>', self._on_partition_select)
 
         right_frame = ttk.Frame(main_pane)
         main_pane.add(right_frame, weight=2)
@@ -344,6 +450,7 @@ class MatchyApp(tk.Tk):
             side=tk.BOTTOM, fill=tk.X, pady=4)
 
     def _build_and_display_partitions(self, files):
+        """Display pairing/partition results in the Results table using data from logic module."""
         tree = self.partition_tree
         for i in tree.get_children():
             tree.delete(i)
@@ -373,7 +480,8 @@ class MatchyApp(tk.Tk):
                 tree.insert("", "end", values=(partition_id, avg_rms_str,
                             m1_name, m2_name, pair_rms_str, strat['leftover']))
 
-    def _on_partition_select(self, event):
+    def _on_partition_select(self):
+        """Handle user selection of a partition and display its corresponding frequency plots."""
         tree = self.partition_tree
         sel = tree.selection()
         if not sel:
@@ -390,6 +498,7 @@ class MatchyApp(tk.Tk):
             self.plot_pair(fns[0], fns[1])
 
     def plot_pair(self, f1_basename, f2_basename):
+        """Plot two selected processed frequency curves for comparison."""
         self.ax2.clear()
         f1p, y1p = self.processed_data_cache.get(
             f1_basename, (np.array([]), np.array([])))
@@ -410,6 +519,7 @@ class MatchyApp(tk.Tk):
         self.canvas2.draw_idle()
 
     def export_list(self):
+        """Export the current partition results to a CSV file selected by the user."""
         if not self.partition_tree.get_children():
             messagebox.showwarning("Export", "No data to export.")
             return
@@ -429,6 +539,7 @@ class MatchyApp(tk.Tk):
             messagebox.showerror("Export CSV", f"Failed to save:\n{e}")
 
     def _attach_sort_menu(self, tree, headers_dict):
+        """Attach a right-click popup menu to allow sorting Treeview columns ascending/descending."""
         menu = tk.Menu(self, tearoff=0)
 
         def do_sort(col, reverse=False):
